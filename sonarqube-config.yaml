@@ -1,0 +1,171 @@
+---
+- name: Install Jenkins on Ubuntu Server
+  hosts: sonarqube_servers
+  become: true
+  vars:
+    sonarqube_volumes_base: "/var/lib/sonarqube"
+    postgres_image: "postgres:latest"
+    sonarqube_port: 9000
+    postgres_password: "sonarqube"
+    postgres_user: "sonarqube"
+    postgres_db: "sonarqube"
+    sonarqube_admin_login: "admin"
+    sonarqube_admin_password: "admin"
+  tasks:
+    - name: Removed Old Installation (docker)
+      become: yes
+      ansible.builtin.package:
+        name: "{{item}}"
+        state: absent
+      loop:
+        - docker
+        - docker-enginge
+        - docker.io
+        - containerd
+        - runc
+    - name: "Docker CE Requirements (Tools)"
+      become: yes
+      ansible.builtin.package:
+          name: "{{item}}"
+          state: present
+          update_cache: yes
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg-agent
+        - software-properties-common
+        - lsb-release
+    # FIXME: Unfortunately the following is distro dependent!
+    - name: Docker CE - GPG key
+      become: yes
+      apt_key:
+        url: https://download.docker.com/linux/debian/gpg
+        state: present
+
+    # FIXME: Unfortunately the following is distro dependent!
+    - name: Docker CE - Added Docker Repository
+      become: yes
+      apt_repository:
+        repo: deb https://download.docker.com/linux/debian bullseye stable
+        state: present
+    - name: Docker CE - Installation
+      become: yes
+      ansible.builtin.package:
+        name: "{{item}}"
+        state: latest
+        update_cache: yes
+      loop:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+        - docker-compose-plugin
+    - name: make sure docker is active
+      become: yes
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+    # - name: Stop nginx for security reasons.
+    #   ansible.builtin.service:
+    #     name: nginx
+    #     state: stopped
+
+    # This is needed to run SonarQube (more accurate ElasticSearch):
+    - name: "sysctl -w vm.max_map_count=262144"
+      ansible.posix.sysctl:
+        name: vm.max_map_count
+        value: '262144'
+        sysctl_set: yes
+    - name: Create volume directories.
+      become: yes
+      ansible.builtin.file:
+        owner: root
+        group: root
+        name: "{{item}}"
+        state: directory
+      loop:
+        - "{{ sonarqube_volumes_base }}"
+        - "{{ sonarqube_volumes_base }}/conf"
+        - "{{ sonarqube_volumes_base }}/data"
+        - "{{ sonarqube_volumes_base }}/extensions"
+        - "{{ sonarqube_volumes_base }}/logs"
+        - "{{ sonarqube_volumes_base }}/postgresql"
+
+    - name: Pull PostgreSQL Image
+      community.docker.docker_image:
+        name: "{{ postgres_image }}"
+        source: pull
+
+    - name: Pull SonarQube Image
+      community.docker.docker_image:
+        name: sonarqube:latest
+        source: pull
+    - name: Create a network (SonarQube)
+      community.docker.docker_network:
+        name: net_sonarqube
+
+    - name: Start PostgreSQL container
+      community.docker.docker_container:
+        name: postgresql-sonarqube
+        image: "{{ postgres_image }}"
+        recreate: true
+        state: "started"
+        restart_policy: "unless-stopped"
+        env:
+          POSTGRES_PASSWORD: "{{ postgres_password }}"
+          POSTGRES_USER: "{{ postgres_user }}"
+          POSTGRES_DB: "{{ postgres_db }}"
+        networks:
+          - name: "net_sonarqube"
+        mounts:
+          - source: volume_sonar_postgres
+            target: /var/lib/postgresql/data
+            
+    # Task to install and configure Nginx as a reverse proxy
+    # - name: Install Nginx
+    #   become: yes
+    #   apt:
+    #     name: nginx
+    #     state: present
+
+    # - name: Configure Nginx as a reverse proxy for SonarQube
+    #   become: yes
+    #   template:
+    #     src: sonarqube_nginx.conf.j2
+    #     dest: /etc/nginx/sites-available/sonarqube
+    #   notify: Restart Nginx
+
+    # - name: Enable the Nginx configuration
+    #   become: yes
+    #   file:
+    #     src: /etc/nginx/sites-available/sonarqube
+    #     dest: /etc/nginx/sites-enabled/sonarqube
+    #     state: link
+
+    - name: Start SonarQube container
+      community.docker.docker_container:
+        name: SonarQube
+        image: sonarqube:latest
+        recreate: true
+        state: "started"
+        restart_policy: "unless-stopped"
+        restart: true
+        ports:
+          - "{{ sonarqube_port }}:9000"
+        env:
+          SONAR_JDBC_USERNAME: "{{ postgres_user }}"
+          SONAR_JDBC_PASSWORD: "{{ postgres_password }}"
+          SONAR_JDBC_URL: "jdbc:postgresql://postgresql-sonarqube:5432/{{ postgres_db }}"
+        networks:
+          - name: "net_sonarqube"
+        mounts:
+          - source: volume_sonar_conf
+            target: /opt/sonarqube/conf
+          - source: volume_sonar_data
+            target: /opt/sonarqube/data
+          - source: volume_sonar_extensions
+            target: /opt/sonarqube/extensions
+          - source: volume_sonar_logs
+            target: /opt/sonarqube/logs
+    
